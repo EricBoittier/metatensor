@@ -559,3 +559,11 @@ def test_error_capture():
         _ = metatensor._data.data_origin(mts_array)
 
     free_mts_array(mts_array)
+
+
+def test_cxx_simple_data_array_is_registered():
+    # Labels and blocks created through the C++ API store their data in
+    # metatensor::SimpleDataArray, which must be readable from Python
+    metatensor.Labels.single()  # make sure the library is loaded
+    origin = metatensor._data._array._register_origin("metatensor::SimpleDataArray")
+    assert metatensor._data._extract._ADDITIONAL_ORIGINS[origin] is ExternalCpuArray
