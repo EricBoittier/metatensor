@@ -211,6 +211,10 @@ def _labels_values_mts_array(array: Array, size: int) -> (mts_array_t, Array):
                 values.flags.writeable = False
             except TypeError as e:
                 raise TypeError("Labels values must be convertible to integers") from e
+        elif backend == "jax":
+            if not _data.array_dtype_is_integer(values):
+                raise TypeError("Labels values must be of integer dtype")
+            values = values.astype(np.int32)
         elif backend == "torch":
             if values.requires_grad:
                 raise ValueError("Labels values can not require gradients")
@@ -311,7 +315,9 @@ class Labels:
             either by construction or because you checked.
         """
 
-        if not isinstance(values, Array.__supertype__):
+        if not isinstance(
+            values, Array.__supertype__
+        ) and not _data._array._is_jax_array(values):
             raise ValueError(
                 "`values` must be a numpy ndarray, torch tensor, or mts_array_t, "
                 f"got {type(values)}"
@@ -334,7 +340,8 @@ class Labels:
 
         self._ptr = ptr
         self._names = names
-        self._cached_values = values
+        # Labels of JAX values on an accelerator are read as numpy (see `values`)
+        self._cached_values = None if _data._array._is_jax_array(values) else values
         self._cached_device = None
 
     @staticmethod
@@ -641,9 +648,19 @@ class Labels:
         as 2-dimensional tensor of 32-bit integers
         """
         if self._cached_values is None:
-            self._cached_values = _data.mts_array_to_python_array(
-                self._raw_values, self
-            )
+            values = _data.mts_array_to_python_array(self._raw_values, self)
+            if _data.array_backend(values) == "jax":
+                # Labels stored next to JAX values on an accelerator: the C library
+                # needs them on that device, but they are static metadata for Python,
+                # so give a numpy copy (also inside jax.jit, where operations on JAX
+                # arrays would be traced)
+                import jax
+
+                if self._cached_device is None:
+                    self._cached_device = _data.array_device(values)
+                with jax.ensure_compile_time_eval():
+                    values = np.asarray(values)
+            self._cached_values = values
 
         return self._cached_values
 
@@ -839,8 +856,25 @@ class Labels:
         jax = sys.modules.get("jax")
         if arrays == "jax" or (jax is not None and isinstance(device, jax.Device)):
             # Labels are metadata: they stay as numpy arrays on CPU when the values of
-            # the blocks use JAX, whatever the device of the values
-            return self.to(arrays="numpy")
+            # the blocks use JAX on CPU. On other devices, they are stored as JAX arrays
+            # on the same device as the values, since a block keeps all its data on a
+            # single device.
+            if device is None or device.platform == "cpu":
+                if (
+                    isinstance(self.device, jax.Device)
+                    and self.device.platform != "cpu"
+                ):
+                    # `values` is a numpy copy of the accelerator Labels
+                    return Labels(
+                        names=self.names, values=self.values, assume_unique=True
+                    )
+                return self.to(arrays="numpy")
+            if _data.array_backend(self.values) == "jax" and self.device == device:
+                return self
+            # labels are static: keep them concrete, also inside jax.jit
+            with jax.ensure_compile_time_eval():
+                values = jax.device_put(np.asarray(self.values, dtype=np.int32), device)
+            return Labels(names=self.names, values=values, assume_unique=True)
 
         already_there = True
         if arrays is not None:
@@ -872,7 +906,10 @@ class Labels:
         Get the device of these Labels.
         """
         if self._cached_device is None:
-            self._cached_device = _data.array_device(self.values)
+            # use the array stored in metatensor: for Labels next to JAX values on an
+            # accelerator, `values` is a numpy copy
+            raw = _data.mts_array_to_python_array(self._raw_values, self)
+            self._cached_device = _data.array_device(raw)
 
         return self._cached_device
 
@@ -924,7 +961,7 @@ class Labels:
         output = ctypes.POINTER(mts_labels_t)()
         self._lib.mts_labels_difference(
             self.as_mts_labels_t(),
-            other.as_mts_labels_t(),
+            self._same_device(other).as_mts_labels_t(),
             ctypes.pointer(output),
             None,
             0,
@@ -965,7 +1002,7 @@ class Labels:
 
         self._lib.mts_labels_difference(
             self.as_mts_labels_t(),
-            other.as_mts_labels_t(),
+            self._same_device(other).as_mts_labels_t(),
             ctypes.pointer(output),
             first_mapping.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             len(first_mapping),
@@ -996,7 +1033,7 @@ class Labels:
         output = ctypes.POINTER(mts_labels_t)()
         self._lib.mts_labels_union(
             self.as_mts_labels_t(),
-            other.as_mts_labels_t(),
+            self._same_device(other).as_mts_labels_t(),
             ctypes.pointer(output),
             None,
             0,
@@ -1044,7 +1081,7 @@ class Labels:
 
         self._lib.mts_labels_union(
             self.as_mts_labels_t(),
-            other.as_mts_labels_t(),
+            self._same_device(other).as_mts_labels_t(),
             ctypes.pointer(output),
             first_mapping.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             len(first_mapping),
@@ -1075,7 +1112,7 @@ class Labels:
         output = ctypes.POINTER(mts_labels_t)()
         self._lib.mts_labels_intersection(
             self.as_mts_labels_t(),
-            other.as_mts_labels_t(),
+            self._same_device(other).as_mts_labels_t(),
             ctypes.pointer(output),
             None,
             0,
@@ -1122,7 +1159,7 @@ class Labels:
 
         self._lib.mts_labels_intersection(
             self.as_mts_labels_t(),
-            other.as_mts_labels_t(),
+            self._same_device(other).as_mts_labels_t(),
             ctypes.pointer(output),
             first_mapping.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
             len(first_mapping),
@@ -1132,6 +1169,36 @@ class Labels:
 
         check_pointer(output)
         return Labels.unsafe_from_ptr(output), first_mapping, second_mapping
+
+    def _next_to(self, values) -> "Labels":
+        """These Labels, on the device of ``values`` when JAX is involved: JAX arrays
+        on an accelerator get Labels on the same device, other arrays get CPU Labels
+        (only Labels created for JAX values can live on an accelerator)."""
+        jax = sys.modules.get("jax")
+        if jax is None:
+            return self
+        if _data.array_backend(values) == "jax" and not _data.array_device_is_cpu(
+            values
+        ):
+            return self.to(device=_data.array_device(values))
+        if isinstance(self.device, jax.Device) and self.device.platform != "cpu":
+            # `values` is a numpy copy: Labels next to CPU (or torch) values
+            return Labels(names=self.names, values=self.values, assume_unique=True)
+        return self
+
+    def _same_device(self, other: "Labels") -> "Labels":
+        """``other``, moved to the device of these Labels when they use JAX on an
+        accelerator (Labels next to JAX values on GPU), since metatensor operations
+        on two Labels require them to be on the same device"""
+        jax = sys.modules.get("jax")
+        if jax is None or str(self.device) == str(other.device):
+            return other
+        if isinstance(self.device, jax.Device):
+            return other.to(device=self.device)
+        if isinstance(other.device, jax.Device) and str(self.device) == "cpu":
+            # `values` is already a numpy copy, rebuild the Labels from it on CPU
+            return Labels(names=other.names, values=other.values, assume_unique=True)
+        return other
 
     def select(self, selection: "Labels") -> np.ndarray:
         """
@@ -1162,7 +1229,7 @@ class Labels:
 
         self._lib.mts_labels_select(
             self.as_mts_labels_t(),
-            selection.as_mts_labels_t(),
+            self._same_device(selection).as_mts_labels_t(),
             selected.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
             ctypes.pointer(selected_count),
         )

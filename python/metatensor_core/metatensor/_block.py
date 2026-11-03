@@ -96,6 +96,11 @@ class TensorBlock:
                 f"`properties` must be metatensor Labels, not {type(properties)}"
             )
 
+        # Labels of JAX blocks live on the device of the values (numpy on CPU)
+        samples = samples._next_to(values)
+        components = [component._next_to(values) for component in components]
+        properties = properties._next_to(values)
+
         components_array = ctypes.ARRAY(ctypes.POINTER(mts_labels_t), len(components))()
         for i, component in enumerate(components):
             components_array[i] = component.as_mts_labels_t()

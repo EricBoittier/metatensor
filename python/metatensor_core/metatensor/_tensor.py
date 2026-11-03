@@ -72,6 +72,10 @@ class TensorMap:
         self._lib = _get_library()
         self._parent = None
 
+        if len(blocks) != 0:
+            # keys of JAX tensors live on the device of the blocks (numpy on CPU)
+            keys = keys._next_to(blocks[0].values)
+
         blocks_array_t = ctypes.POINTER(mts_block_t) * len(blocks)
         blocks_array = blocks_array_t(*[block.release() for block in blocks])
 

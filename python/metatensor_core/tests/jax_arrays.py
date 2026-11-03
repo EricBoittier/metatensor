@@ -268,3 +268,67 @@ def test_traced_data():
 
     with pytest.raises(ValueError, match=message):
         save(tensor())
+
+
+def _gpu():
+    try:
+        return jax.devices("gpu")[0]
+    except RuntimeError:
+        return None
+
+
+@pytest.mark.skipif(_gpu() is None, reason="requires a GPU for JAX")
+def test_gpu_labels_follow_values():
+    gpu = _gpu()
+    values = jax.device_put(jnp.arange(24.0).reshape(2, 3, 4), gpu)
+
+    # labels given as numpy are moved to the device of the values
+    gpu_block = block(values)
+    assert gpu_block.device == gpu
+    assert gpu_block.samples.device == gpu
+    assert gpu_block.properties.device == gpu
+    # ... but still read as numpy arrays on the Python side
+    assert isinstance(gpu_block.samples.values, np.ndarray)
+    np.testing.assert_equal(gpu_block.samples.values, [[0], [1]])
+
+    gpu_tensor = TensorMap(Labels.range("key", 2), [gpu_block, block(values + 1)])
+    assert gpu_tensor.keys.device == gpu
+    np.testing.assert_equal(gpu_tensor.keys.values, [[0], [1]])
+    np.testing.assert_allclose(gpu_tensor.block(1).values, values + 1)
+
+    # operations between labels on CPU and labels on GPU
+    selection = Labels(["key"], np.array([[1]], dtype=np.int32))
+    np.testing.assert_equal(gpu_tensor.keys.select(selection), [1])
+    assert gpu_tensor.keys.union(Labels.range("key", 3)) == Labels.range("key", 3)
+    assert selection.intersection(gpu_tensor.keys) == selection
+
+    # moving back to the CPU gives numpy labels
+    cpu_labels = gpu_tensor.keys.to(device=jax.devices("cpu")[0])
+    assert cpu_labels.device == "cpu"
+
+
+@pytest.mark.skipif(_gpu() is None, reason="requires a GPU for JAX")
+def test_gpu_transformations():
+    gpu = _gpu()
+    values = jax.device_put(jnp.arange(24.0).reshape(2, 3, 4), gpu)
+
+    @jax.jit
+    def double(tensor):
+        return TensorMap(
+            tensor.keys,
+            [block(2 * b.values, gradient=False) for b in tensor.blocks()],
+        )
+
+    tensor = TensorMap(Labels.range("key", 1), [block(values, gradient=False)])
+    result = double(tensor)
+    assert result.block().device == gpu
+    np.testing.assert_allclose(result.block().values, 2 * values)
+
+    grad = jax.grad(
+        lambda x: (
+            double(TensorMap(Labels.range("key", 1), [block(x, gradient=False)]))
+            .block()
+            .values.sum()
+        )
+    )(values)
+    np.testing.assert_allclose(grad, 2 * np.ones((2, 3, 4)))

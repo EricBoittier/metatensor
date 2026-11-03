@@ -1,3 +1,4 @@
+import contextlib
 import ctypes
 import sys
 from typing import NewType, Union
@@ -133,6 +134,18 @@ def _jax_dlpack_device(array):
         _JAX_DLPACK_DEVICES[device] = dlpack_device
 
     return _JAX_DLPACK_DEVICES[device]
+
+
+def _jax_eager_if_concrete(*arrays):
+    """Evaluate JAX operations eagerly when all ``arrays`` are concrete, also while
+    tracing a function: arrays the C library builds from concrete arrays (e.g. the
+    values of new Labels) stay concrete instead of becoming traced values."""
+    if any(_is_jax_tracer(array) for array in arrays):
+        return contextlib.nullcontext()
+
+    import jax
+
+    return jax.ensure_compile_time_eval()
 
 
 def _jax_device(dl_device):
@@ -510,7 +523,8 @@ def _mts_array_create(this, shape_ptr, shape_count, fill_value, new_array):
         import jax.numpy as jnp
 
         (device,) = _jax_devices(wrapper.array)
-        array = jnp.full(shape, scalar, dtype=dtype, device=device)
+        with _jax_eager_if_concrete(wrapper.array):
+            array = jnp.full(shape, scalar, dtype=dtype, device=device)
 
     if ctypes.cast(fill_value.destroy, ctypes.c_void_p).value is not None:
         fill_value.destroy(fill_value.ptr)
@@ -551,10 +565,11 @@ def _mts_array_copy(this, device, new_array):
         import jax.numpy as jnp
 
         target = _jax_device(device)
-        if target in _jax_devices(wrapper.array):
-            array = jnp.array(wrapper.array, copy=True)
-        else:
-            array = jax.device_put(wrapper.array, target)
+        with _jax_eager_if_concrete(wrapper.array):
+            if target in _jax_devices(wrapper.array):
+                array = jnp.array(wrapper.array, copy=True)
+            else:
+                array = jax.device_put(wrapper.array, target)
 
     new_array[0] = create_mts_array(array)
 
@@ -655,7 +670,8 @@ class _JaxSetter:
         self.array = array
 
     def __setitem__(self, index, value):
-        self.array = self.array.at[index].set(value)
+        with _jax_eager_if_concrete(self.array, value):
+            self.array = self.array.at[index].set(value)
 
 
 @catch_exceptions
@@ -674,8 +690,24 @@ def _mts_array_as_dlpack(this, dl_managed_tensor_ptr_ptr, device, stream, max_ve
         )
 
     stream = None if not stream else stream.contents
+    array = wrapper.array
+    if _is_jax_array(array):
+        # metatensor asks for a CPU view of data living on an accelerator (e.g. to
+        # check labels of JAX arrays on GPU): JAX's DLPack export does not copy across
+        # devices, so make the copy here
+        current = _jax_dlpack_device(array)
+        if (device.device_type, device.device_id) != tuple(current):
+            import jax
+
+            with jax.ensure_compile_time_eval():
+                array = jax.device_put(array, _jax_device(device))
+        # JAX only exports with stream=None: wait for the data instead of handing a
+        # stream to synchronize on
+        array.block_until_ready()
+        stream = None
+
     versioned_ptr = array_as_dlpack(
-        wrapper.array, dl_device=device, stream=stream, max_version=max_version
+        array, dl_device=device, stream=stream, max_version=max_version
     )
 
     dl_managed_tensor_ptr_ptr[0] = versioned_ptr
